@@ -9,18 +9,21 @@ import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
 import random
 from tqdm import tqdm
+import argparse
+import time
 
 # ============== CONFIGURATION ==============
 BASE_DIR = r"C:\Users\Admin\deepfake"
-fake_source = os.path.join(BASE_DIR, "train/fake")
-fake_output = os.path.join(BASE_DIR, "train/fake_augmented")
+fake_source = os.path.join(BASE_DIR, "valid/fake")
+fake_output = os.path.join(BASE_DIR, "valid/fake_augmented")
 os.makedirs(fake_output, exist_ok=True)
 
-# How many augmented versions per image
+# How many augmented versions per image (default, can be overridden via CLI)
 AUGMENTATIONS_PER_IMAGE = 15
+# Default multiplier (produce roughly multiplier * existing_count images)
+DEFAULT_MULTIPLIER = 3
 
 # ============== ADVANCED AUGMENTATION TECHNIQUES ==============
-
 class DisasterImageAugmenter:
     """
     Specialized augmentation for fake disaster image detection
@@ -40,13 +43,15 @@ class DisasterImageAugmenter:
         """Simulate JPEG compression artifacts"""
         if quality is None:
             quality = random.randint(60, 95)
-        
         from io import BytesIO
         buffer = BytesIO()
         img.save(buffer, format='JPEG', quality=quality)
         buffer.seek(0)
-        return Image.open(buffer)
-    
+        # return a copied Image (load buffer while open) and ensure RGB
+        out = Image.open(buffer).convert('RGB').copy()
+        buffer.close()
+        return out
+
     @staticmethod
     def color_shift(img):
         """Shift color channels (common in fake images)"""
@@ -63,16 +68,21 @@ class DisasterImageAugmenter:
         """Local blur (simulates AI generation artifacts)"""
         img_array = np.array(img)
         h, w = img_array.shape[:2]
-        
-        # Random rectangular region
-        x1, y1 = random.randint(0, w//2), random.randint(0, h//2)
-        x2, y2 = random.randint(w//2, w), random.randint(h//2, h)
-        
-        # Blur that region
-        region = img_array[y1:y2, x1:x2]
-        blurred = cv2.GaussianBlur(region, (15, 15), 0)
-        img_array[y1:y2, x1:x2] = blurred
-        
+
+        # Random rectangular region (ensure width/height >= 10)
+        x1 = random.randint(0, max(0, w - 10))
+        y1 = random.randint(0, max(0, h - 10))
+        x2 = random.randint(min(w, x1 + 10), w)
+        y2 = random.randint(min(h, y1 + 10), h)
+
+        # Blur that region only if valid
+        if x2 > x1 and y2 > y1:
+            region = img_array[y1:y2, x1:x2]
+            # kernel size should be odd and <= region dims
+            k = min(31, max(3, (min(region.shape[0], region.shape[1]) // 10) * 2 + 1))
+            blurred = cv2.GaussianBlur(region, (k, k), 0)
+            img_array[y1:y2, x1:x2] = blurred
+
         return Image.fromarray(img_array)
     
     @staticmethod
@@ -180,77 +190,133 @@ class DisasterImageAugmenter:
             DisasterImageAugmenter.perspective_warp,
             DisasterImageAugmenter.add_weather_effect
         ]
-        
+
         selected_augs = random.sample(augmentations, min(num_augs, len(augmentations)))
-        
+
         for aug in selected_augs:
             try:
                 img = aug(img)
+                # ensure returned image is PIL RGB
+                if not isinstance(img, Image.Image):
+                    img = Image.fromarray(np.array(img)).convert('RGB')
+                else:
+                    img = img.convert('RGB')
             except Exception as e:
                 print(f"[WARNING] Augmentation failed: {e}")
                 continue
-        
+
         return img
 
-
 # ============== MAIN AUGMENTATION LOOP ==============
+def augment_dataset(source=None, output=None, per_image=None, multiplier=None, target_total=None, seed=None):
+    """Generate augmented versions of fake images.
+    - source: source folder with original images
+    - output: where to save augmented images
+    - per_image: augmentations per original image
+    - multiplier: generate about multiplier * N images total (including originals)
+    - target_total: explicit target total images in output (including originals)
+    """
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
 
-def augment_dataset():
-    """Generate augmented versions of all fake images"""
-    
-    print(f"[START] Augmenting fake disaster images...")
-    print(f"        Source: {fake_source}")
-    print(f"        Output: {fake_output}")
-    print(f"        Augmentations per image: {AUGMENTATIONS_PER_IMAGE}")
-    
-    # Get all fake images
-    fake_images = [f for f in os.listdir(fake_source) 
-                   if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-    
-    if len(fake_images) == 0:
-        print("[ERROR] No images found in fake source directory!")
+    src = source or fake_source
+    out = output or fake_output
+    per_image = per_image if per_image is not None else AUGMENTATIONS_PER_IMAGE
+
+    if not os.path.isdir(src):
+        print(f"[ERROR] Source directory does not exist: {src}")
         return
-    
-    print(f"\n[INFO] Found {len(fake_images)} fake images")
-    print(f"[INFO] Will generate {len(fake_images) * AUGMENTATIONS_PER_IMAGE} total images\n")
-    
+
+    os.makedirs(out, exist_ok=True)
+
+    # collect originals from source
+    fake_images = [f for f in os.listdir(src)
+                   if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+
+    if len(fake_images) == 0:
+        print("[ERROR] No images found in source directory!")
+        return
+
+    orig_count = len(fake_images)
+    print(f"[START] Found {orig_count} source images in {src}")
+
+    # Determine required number of augmented images
+    if target_total is not None:
+        required_total = int(target_total)
+    elif multiplier is not None:
+        required_total = int(orig_count * multiplier)
+    else:
+        required_total = orig_count * (per_image + 1)  # original + per_image each
+
+    # Count current images in output to avoid duplicating work
+    existing_out_images = [f for f in os.listdir(out)
+                           if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    current_out_count = len(existing_out_images)
+    print(f"[INFO] Output currently has {current_out_count} images, target is {required_total}")
+
+    # If output already meets or exceeds required, skip generation
+    if current_out_count >= required_total:
+        print("[INFO] Output already meets or exceeds target. No augmentation performed.")
+        return
+
+    to_generate = required_total - current_out_count
+    print(f"[INFO] Need to generate approximately {to_generate} images")
+
     augmenter = DisasterImageAugmenter()
-    total_generated = 0
-    
-    for img_file in tqdm(fake_images, desc="Augmenting"):
+    generated = 0
+    start_time = time.time()
+
+    # iterate through source images repeatedly until we hit target
+    idx = 0
+    while generated < to_generate:
+        img_file = fake_images[idx % orig_count]
         try:
-            img_path = os.path.join(fake_source, img_file)
+            img_path = os.path.join(src, img_file)
             img = Image.open(img_path).convert('RGB')
-            
-            # Save original
+
             base_name = os.path.splitext(img_file)[0]
-            img.save(os.path.join(fake_output, f"{base_name}_original.jpg"))
-            total_generated += 1
-            
-            # Generate augmented versions
-            for i in range(AUGMENTATIONS_PER_IMAGE):
-                # Apply 2-4 random augmentations
+            # Optionally save the original into output once (if not present)
+            orig_out_name = f"{base_name}_original.jpg"
+            if orig_out_name not in existing_out_images and generated < to_generate:
+                img.save(os.path.join(out, orig_out_name), quality=95)
+                existing_out_images.append(orig_out_name)
+                generated += 1
+
+            # number of augmentations to create from this source this pass
+            # attempt to evenly distribute work across files
+            create_count = min(per_image, to_generate - generated)
+
+            for i in range(create_count):
                 num_augs = random.randint(2, 4)
                 aug_img = augmenter.apply_random_augmentations(img.copy(), num_augs)
-                
-                # Save augmented image
-                output_name = f"{base_name}_aug_{i:03d}.jpg"
-                aug_img.save(os.path.join(fake_output, output_name), quality=95)
-                total_generated += 1
-                
-        except Exception as e:
-            print(f"\n[ERROR] Failed to process {img_file}: {e}")
-            continue
-    
-    print(f"\n[DONE] Generated {total_generated} images")
-    print(f"[INFO] Original images: {len(fake_images)}")
-    print(f"[INFO] Augmented images: {total_generated - len(fake_images)}")
-    print(f"\n[NEXT STEP] Update your training script:")
-    print(f"            train_dirs = [")
-    print(f"                (r'{BASE_DIR}\\train\\real', None, 0),")
-    print(f"                (r'{fake_output}', None, 1)  # Use augmented fake images")
-    print(f"            ]")
+                # unique name with timestamp and counter to avoid collisions
+                ts = int(time.time() * 1000) % 1000000
+                output_name = f"{base_name}_aug_{idx}_{i}_{ts}.jpg"
+                aug_img.save(os.path.join(out, output_name), quality=95)
+                generated += 1
+                if generated >= to_generate:
+                    break
 
+        except Exception as e:
+            print(f"[ERROR] Failed to process {img_file}: {e}")
+
+        idx += 1
+
+    elapsed = time.time() - start_time
+    print(f"[DONE] Generated {generated} new images in {elapsed:.1f}s")
+    total_now = len([f for f in os.listdir(out) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+    print(f"[INFO] Output now contains {total_now} images (target was {required_total})")
 
 if __name__ == "__main__":
-    augment_dataset()
+    parser = argparse.ArgumentParser(description="Augment fake images to boost dataset size")
+    parser.add_argument("--source", "-s", help="Source folder (default valid/fake)", default=None)
+    parser.add_argument("--output", "-o", help="Output folder (default valid/fake_augmented)", default=None)
+    parser.add_argument("--per-image", "-p", type=int, help="Augmentations per source image", default=None)
+    parser.add_argument("--multiplier", "-m", type=float, help="Target multiplier (eg 3 to make 3x total)", default=None)
+    parser.add_argument("--target-total", "-t", type=int, help="Exact target total images in output (including originals)", default=None)
+    parser.add_argument("--seed", type=int, help="Random seed", default=None)
+    args = parser.parse_args()
+
+    augment_dataset(source=args.source, output=args.output, per_image=args.per_image,
+                    multiplier=args.multiplier, target_total=args.target_total, seed=args.seed)
