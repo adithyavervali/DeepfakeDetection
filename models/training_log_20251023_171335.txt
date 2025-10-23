@@ -1,0 +1,12 @@
+
+[TRAIN] Training Configuration:
+        Device: cpu
+        Max Epochs: 25
+        Batch Size: 8
+        Learning Rate: 2e-05
+        Patience: 4
+        Log file: C:\Users\Admin\deepfake\models\training_log_20251023_171335.txt
+================================================================================
+
+[EPOCH] 1/25
+--------------------------------------------------------------------------------
